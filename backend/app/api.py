@@ -176,29 +176,39 @@ def _build_context_block(context: dict | None) -> str:
 
 def _get_configured_gemini_key() -> tuple[str, str | None]:
     """
-    Safely retrieves the GEMINI_API_KEY from environment.
-    Falls back to loading backend/.env if not present in os.environ.
-    Never prints, logs, or returns the key in error messages.
+    Safely retrieves the GEMINI_API_KEY from environment variables (os.environ).
+    In local development, falls back to reading a local .env file if available.
+    Never prints, logs, or returns the key value in error messages.
     """
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not key:
+    # 1. Primary: read directly from system environment variables (Render, Docker, host)
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+    # 2. Local development fallback: check local .env files only if not in os.environ
+    if not key or key == "YOUR_GEMINI_API_KEY_HERE":
         backend_env = Path(__file__).resolve().parent.parent / ".env"
-        if backend_env.exists():
-            try:
-                from dotenv import dotenv_values
+        root_env = Path(__file__).resolve().parent.parent.parent / ".env"
+        for candidate in (backend_env, root_env):
+            if candidate.exists():
+                try:
+                    from dotenv import dotenv_values
 
-                env_vals = dotenv_values(backend_env)
-                key = env_vals.get("GEMINI_API_KEY", "").strip()
-            except Exception:
-                pass
+                    env_vals = dotenv_values(candidate)
+                    file_key = env_vals.get("GEMINI_API_KEY", "").strip()
+                    if file_key and file_key != "YOUR_GEMINI_API_KEY_HERE":
+                        key = file_key
+                        break
+                except Exception:
+                    pass
 
+    # 3. Clean validation without referencing local files in production
     if not key:
         return (
             "",
-            "GEMINI_API_KEY is not configured in backend/.env. Please set your Google AI Studio API key.",
+            "The SkinSafe AI Assistant is currently unconfigured. "
+            "Please configure the GEMINI_API_KEY environment variable in your deployment settings.",
         )
 
-    # Detect common placeholder patterns
+    # 4. Detect common placeholder patterns
     if (
         "YOUR_GEMINI" in key
         or "placeholder" in key.lower()
@@ -207,8 +217,8 @@ def _get_configured_gemini_key() -> tuple[str, str | None]:
     ):
         return (
             "",
-            "GEMINI_API_KEY in backend/.env still contains placeholder text. "
-            "Please replace it with a valid Gemini API key from Google AI Studio (https://aistudio.google.com).",
+            "The GEMINI_API_KEY environment variable contains placeholder text. "
+            "Please configure a valid Google AI Studio API key in your deployment settings.",
         )
 
     return key, None
@@ -244,7 +254,10 @@ def assistant_chat(payload: AssistantChatRequest) -> AssistantChatResponse:
         # Politely decline out-of-domain, prompt-injection, or general queries
         return AssistantChatResponse(
             reply=direct_reply
-            or "I am specialized exclusively in cosmetic chemistry and skin permeability analysis."
+            or (
+                "I'm specialised in cosmetic chemistry, cosmetic ingredient analysis, and skin permeability research. "
+                "I can't assist with unrelated topics, but I'd be happy to help with your chemical investigation!"
+            )
         )
 
     # If domain guard produced a pre-baked greeting response, return it directly
