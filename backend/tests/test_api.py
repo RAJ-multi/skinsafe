@@ -289,3 +289,38 @@ def test_8_configured_gemini_api_key(monkeypatch):
     assert "138.12" in response.json()["reply"]
 
 
+def test_assistant_uses_host_environment_and_logs_safe_gemini_config(monkeypatch, caplog):
+    """Reproduce Render env configuration and guard against stale .env-only behavior."""
+    import logging
+    from unittest.mock import MagicMock, patch
+    from google import genai
+
+    secret = "AIzaSyRegressionKeyMustNeverAppearInLogs123"
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.text = "The molecular weight is 138.12 g/mol."
+    mock_client.models.generate_content.return_value = mock_response
+    monkeypatch.setattr(genai, "Client", MagicMock(return_value=mock_client))
+    monkeypatch.setenv("GEMINI_API_KEY", secret)
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    caplog.set_level(logging.INFO, logger="app.api")
+
+    # Simulate a deployed process that also has a local .env file. Host environment
+    # values must win, and dotenv should not be consulted for an already-set key.
+    with patch("app.api.Path.exists", return_value=True), patch(
+        "dotenv.dotenv_values", return_value={"GEMINI_API_KEY": "stale-file-value"}
+    ) as dotenv_values:
+        response = client.post(
+            "/api/v1/assistant/chat",
+            json={"message": "What is the molecular weight of salicylic acid?"},
+        )
+
+    assert response.status_code == 200
+    assert "138.12" in response.json()["reply"]
+    dotenv_values.assert_not_called()
+    mock_client.models.generate_content.assert_called_once()
+    assert mock_client.models.generate_content.call_args.kwargs["model"] == "gemini-2.5-flash"
+    assert "api_key_configured=True model=gemini-2.5-flash" in caplog.text
+    assert secret not in caplog.text
+
+

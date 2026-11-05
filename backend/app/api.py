@@ -264,8 +264,16 @@ def assistant_chat(payload: AssistantChatRequest) -> AssistantChatResponse:
     if direct_reply:
         return AssistantChatResponse(reply=direct_reply)
 
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+
     # 2. Check and validate GEMINI_API_KEY
     api_key, config_error = _get_configured_gemini_key()
+    # Log presence only; never include the credential or any portion of it.
+    logger.info(
+        "Gemini configuration: api_key_configured=%s model=%s",
+        bool(api_key),
+        model_name,
+    )
     if config_error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -291,7 +299,6 @@ def assistant_chat(payload: AssistantChatRequest) -> AssistantChatResponse:
 
     context_block = _build_context_block(payload.context)
     full_system_prompt = _ASSISTANT_SYSTEM_PROMPT + context_block
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     # 4. Execute request to Gemini
     try:
