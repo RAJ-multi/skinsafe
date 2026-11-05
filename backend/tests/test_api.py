@@ -3,6 +3,7 @@ Integration tests for SkinSafe FastAPI REST Endpoints.
 """
 
 from fastapi.testclient import TestClient
+import pytest
 from app.main import app
 
 client = TestClient(app)
@@ -322,5 +323,111 @@ def test_assistant_uses_host_environment_and_logs_safe_gemini_config(monkeypatch
     assert mock_client.models.generate_content.call_args.kwargs["model"] == "gemini-2.5-flash"
     assert "api_key_configured=True model=gemini-2.5-flash" in caplog.text
     assert secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "upstream_status, expected_status, expected_type",
+    [
+        (400, 502, "InvalidGeminiRequest"),
+        (403, 502, "GeminiAccessDenied"),
+        (404, 502, "GeminiModelUnavailable"),
+        (429, 429, "RateLimitExceeded"),
+        (503, 503, "GeminiUpstreamUnavailable"),
+    ],
+)
+def test_assistant_maps_gemini_api_errors_safely(
+    monkeypatch, caplog, upstream_status, expected_status, expected_type
+):
+    """Map google-genai error metadata without logging credentials or switching models."""
+    import logging
+    from unittest.mock import MagicMock
+    from fastapi import HTTPException
+    from google import genai
+    from google.genai.errors import ClientError, ServerError
+    from app.api import assistant_chat
+    from app.schemas import AssistantChatRequest
+
+    secret = "AIzaSyRegressionCredentialNeverLog123456789"
+    google_status = {
+        400: "INVALID_ARGUMENT",
+        403: "PERMISSION_DENIED",
+        404: "NOT_FOUND",
+        429: "RESOURCE_EXHAUSTED",
+        503: "UNAVAILABLE",
+    }[upstream_status]
+    upstream_message = f"Request rejected for API key {secret}"
+    sdk_error_type = ServerError if upstream_status >= 500 else ClientError
+    sdk_error = sdk_error_type(
+        upstream_status,
+        {
+            "error": {
+                "code": upstream_status,
+                "message": upstream_message,
+                "status": google_status,
+            }
+        },
+    )
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = sdk_error
+    monkeypatch.setattr(genai, "Client", MagicMock(return_value=mock_client))
+    monkeypatch.setenv("GEMINI_API_KEY", secret)
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    caplog.set_level(logging.WARNING, logger="app.api")
+
+    with pytest.raises(HTTPException) as raised:
+        assistant_chat(
+            AssistantChatRequest(message="What is an amide bond in organic chemistry?")
+        )
+
+    assert raised.value.status_code == expected_status
+    assert raised.value.detail["error_type"] == expected_type
+    assert secret not in caplog.text
+    assert "http_status=" + str(upstream_status) in caplog.text
+    assert f"google_error_code={upstream_status}" in caplog.text
+    assert f"google_status={google_status}" in caplog.text
+    assert "model=gemini-2.5-flash" in caplog.text
+    assert "api_key_configured=True" in caplog.text
+    assert "[REDACTED]" in caplog.text
+    mock_client.models.generate_content.assert_called_once()
+    assert (
+        mock_client.models.generate_content.call_args.kwargs["model"]
+        == "gemini-2.5-flash"
+    )
+
+
+@pytest.mark.parametrize(
+    "message, expected_text",
+    [
+        ("Hi", "SkinSafe"),
+        ("Who won the Super Bowl?", "cosmetic chemistry"),
+    ],
+)
+def test_assistant_greetings_and_domain_refusals_bypass_gemini(
+    monkeypatch, message, expected_text
+):
+    """Keep direct greeting and out-of-domain paths independent of Gemini failures."""
+    from unittest.mock import MagicMock
+    from google import genai
+    from app.api import assistant_chat
+    from app.schemas import AssistantChatRequest
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    mock_client_factory = MagicMock()
+    monkeypatch.setattr(genai, "Client", mock_client_factory)
+
+    result = assistant_chat(AssistantChatRequest(message=message))
+
+    assert expected_text.lower() in result.reply.lower()
+    mock_client_factory.assert_not_called()
+
+
+def test_assistant_context_serialization_is_preserved():
+    """Ensure contextual molecule data still reaches the Gemini prompt builder."""
+    from app.api import _build_context_block
+
+    context_block = _build_context_block({"molecular_weight": 122.12})
+
+    assert "CURRENT ANALYSIS CONTEXT" in context_block
+    assert '"molecular_weight": 122.12' in context_block
 
 

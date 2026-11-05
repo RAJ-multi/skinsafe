@@ -6,6 +6,7 @@ Handles chemical analysis requests and health status.
 import os
 import json
 import logging
+import re
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, status
 from rdkit import __version__ as rdkit_version
@@ -174,6 +175,57 @@ def _build_context_block(context: dict | None) -> str:
         return ""
 
 
+def _sanitize_gemini_error_message(message: object, api_key: str = "") -> str:
+    """Return a bounded, single-line upstream message with credentials redacted."""
+    sanitized = " ".join(str(message or "").split())
+    if api_key:
+        sanitized = sanitized.replace(api_key, "[REDACTED]")
+
+    patterns = (
+        (r"(?i)(\bBearer\s+)[^\s,;]+", r"\1[REDACTED]"),
+        (
+            r"(?i)(\b(?:authorization|x-goog-api-key|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token)\b\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+            r"\1[REDACTED]",
+        ),
+        (r"\bAIza[0-9A-Za-z_-]{20,}\b", "[REDACTED]"),
+        (r"(?i)([?&](?:key|token|access_token)=)[^&\s]+", r"\1[REDACTED]"),
+    )
+    for pattern, replacement in patterns:
+        sanitized = re.sub(pattern, replacement, sanitized)
+    return sanitized[:500]
+
+
+def _gemini_error_metadata(api_err: Exception, api_key: str) -> dict[str, object]:
+    """Extract only the safe, useful fields from google-genai APIError."""
+    details = getattr(api_err, "details", None)
+    body = details if isinstance(details, dict) else {}
+    google_error = body.get("error", body)
+    if not isinstance(google_error, dict):
+        google_error = {}
+
+    http_status = getattr(api_err, "code", None)
+    if not isinstance(http_status, int):
+        response = getattr(api_err, "response", None)
+        http_status = getattr(response, "status_code", None)
+
+    google_code = google_error.get("code")
+    if not (
+        isinstance(google_code, int)
+        or isinstance(google_code, str)
+        and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", google_code)
+    ):
+        google_code = None
+    google_status = google_error.get("status") or getattr(api_err, "status", None)
+    message = google_error.get("message") or getattr(api_err, "message", None)
+
+    return {
+        "http_status": http_status if isinstance(http_status, int) else None,
+        "google_error_code": str(google_code)[:64] if google_code is not None else None,
+        "google_status": _sanitize_gemini_error_message(google_status, api_key) or None,
+        "message": _sanitize_gemini_error_message(message, api_key),
+    }
+
+
 def _get_configured_gemini_key() -> tuple[str, str | None]:
     """
     Safely retrieves the GEMINI_API_KEY from environment variables (os.environ).
@@ -303,30 +355,14 @@ def assistant_chat(payload: AssistantChatRequest) -> AssistantChatResponse:
     # 4. Execute request to Gemini
     try:
         client = genai.Client(api_key=api_key)
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=user_message,
-                config=types.GenerateContentConfig(
-                    system_instruction=full_system_prompt,
-                    temperature=0.2,
-                ),
-            )
-        except Exception as model_err:
-            # Fallback to gemini-1.5-flash if 2.5-flash is not available
-            err_str = str(model_err)
-            if "not found" in err_str.lower() or "404" in err_str:
-                logger.info("Falling back to gemini-1.5-flash")
-                response = client.models.generate_content(
-                    model="gemini-1.5-flash",
-                    contents=user_message,
-                    config=types.GenerateContentConfig(
-                        system_instruction=full_system_prompt,
-                        temperature=0.2,
-                    ),
-                )
-            else:
-                raise model_err
+        response = client.models.generate_content(
+            model=model_name,
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=full_system_prompt,
+                temperature=0.2,
+            ),
+        )
 
         reply_text = (
             response.text.strip()
@@ -336,45 +372,58 @@ def assistant_chat(payload: AssistantChatRequest) -> AssistantChatResponse:
         return AssistantChatResponse(reply=reply_text)
 
     except APIError as api_err:
-        err_msg = str(api_err)
-        logger.warning("Gemini API error occurred: %s", type(api_err).__name__)
-        if (
-            "API_KEY_INVALID" in err_msg
-            or "INVALID_ARGUMENT" in err_msg
-            or getattr(api_err, "code", None) == 400
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={
-                    "error_type": "InvalidApiKey",
-                    "message": (
-                        "The configured Gemini API key is invalid or unrecognized by Google AI Studio. "
-                        "Please verify the GEMINI_API_KEY in backend/.env is a valid key starting with 'AIza'."
-                    ),
-                },
-            )
-        elif (
-            "RESOURCE_EXHAUSTED" in err_msg
-            or getattr(api_err, "code", None) == 429
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={
-                    "error_type": "RateLimitExceeded",
-                    "message": "Gemini API quota or rate limit exceeded. Please try again shortly.",
-                },
-            )
+        error_info = _gemini_error_metadata(api_err, api_key)
+        http_status = error_info["http_status"]
+        logger.warning(
+            "Gemini API request failed: http_status=%s google_error_code=%s "
+            "google_status=%s model=%s api_key_configured=%s message=%s",
+            http_status,
+            error_info["google_error_code"],
+            error_info["google_status"],
+            model_name,
+            bool(api_key),
+            error_info["message"] or "No upstream message provided",
+        )
+
+        error_responses = {
+            400: (
+                "InvalidGeminiRequest",
+                "Gemini rejected the request. Check the request configuration and API key settings.",
+                status.HTTP_502_BAD_GATEWAY,
+            ),
+            403: (
+                "GeminiAccessDenied",
+                "Gemini denied access. Check the API key permissions and restrictions in Google AI Studio.",
+                status.HTTP_502_BAD_GATEWAY,
+            ),
+            404: (
+                "GeminiModelUnavailable",
+                f"The configured Gemini model '{model_name}' or API endpoint is unavailable to this service.",
+                status.HTTP_502_BAD_GATEWAY,
+            ),
+            429: (
+                "RateLimitExceeded",
+                "Gemini quota or rate limit reached. Check the project quota or try again later.",
+                status.HTTP_429_TOO_MANY_REQUESTS,
+            ),
+        }
+        if isinstance(http_status, int) and 500 <= http_status <= 599:
+            error_type = "GeminiUpstreamUnavailable"
+            message = "Google Gemini is temporarily unavailable. Please try again shortly."
+            response_status = status.HTTP_503_SERVICE_UNAVAILABLE
         else:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={
-                    "error_type": "AssistantError",
-                    "message": (
-                        "The AI assistant encountered an upstream error communicating with Google Gemini. "
-                        "Please check backend logs or try again."
-                    ),
-                },
+            error_type, message, response_status = error_responses.get(
+                http_status,
+                (
+                    "GeminiRequestFailed",
+                    "The AI assistant could not complete the Gemini request. Please try again later.",
+                    status.HTTP_502_BAD_GATEWAY,
+                ),
             )
+        raise HTTPException(
+            status_code=response_status,
+            detail={"error_type": error_type, "message": message},
+        )
     except Exception as err:
         logger.warning("Unexpected assistant error: %s", type(err).__name__)
         err_str = str(err)
